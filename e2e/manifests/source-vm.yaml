@@ -1,0 +1,81 @@
+---
+# Source VictoriaMetrics single-node instance
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-vm
+  namespace: e2e-source
+  labels:
+    app: victoria-metrics
+    role: source
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: victoria-metrics
+      role: source
+  template:
+    metadata:
+      labels:
+        app: victoria-metrics
+        role: source
+    spec:
+      containers:
+        - name: victoria-metrics
+          image: victoriametrics/victoria-metrics:v1.118.0
+          args:
+            - "--storageDataPath=/storage"
+            - "--httpListenAddr=:8428"
+            - "--retentionPeriod=12"
+            # Raise limits to support high cardinality e2e test
+            - "--search.maxSeries=500000"
+            - "--search.maxUniqueTimeseries=500000"
+            - "--search.maxExportSeries=500000"
+          ports:
+            - containerPort: 8428
+              name: http
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          volumeMounts:
+            - name: storage
+              mountPath: /storage
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8428
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8428
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: source-vm
+  namespace: e2e-source
+  labels:
+    app: victoria-metrics
+    role: source
+spec:
+  type: NodePort
+  selector:
+    app: victoria-metrics
+    role: source
+  ports:
+    - port: 8428
+      targetPort: 8428
+      nodePort: 30428
+      name: http

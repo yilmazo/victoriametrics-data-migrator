@@ -1,0 +1,105 @@
+# vm-migrator example configuration
+# Copy this file and adjust values for your environment.
+
+source:
+  vmselect_url: "http://vmselect.source.svc:8481/select/0/prometheus"
+  # bearer_token: "your-token-here"
+  # basic_auth:
+  #   username: "user"
+  #   password: "pass"
+  # headers:
+  #   X-Custom-Header: "value"
+  tls:
+    insecure_skip_verify: false
+
+destination:
+  vminsert_url: "http://vminsert.dest.svc:8480/insert/0/prometheus"
+  tls:
+    insecure_skip_verify: false
+
+migration:
+  # PromQL selector to match metrics to migrate
+  # This example migrates everything except VM internal metrics
+  filter_match: '{__name__!~"vm_.*"}'
+  
+  # Time range to migrate (DD.MM.YYYY or RFC3339 format)
+  start_date: "13.01.2026"
+  end_date: "13.05.2026"
+  
+  # How to split the time range: "day", "hour", or "month"
+  time_step: "day"
+  
+  # Process time ranges from newest to oldest
+  reverse_order: true
+
+splitting:
+  # Maximum series count per vmctl task
+  max_series_per_task: 100000
+  
+  # Safety margin (effective_max = max_series * (1 - safety_margin))
+  safety_margin: 0.2
+  
+  # Max label values in a single regex matcher
+  max_regex_values: 200
+  
+  # Labels to prefer when choosing split dimension (tried in order)
+  preferred_split_labels:
+    - "instance"
+    - "pod"
+    - "namespace"
+    - "le"
+    - "job"
+  
+  # Labels to never split by
+  exclude_split_labels:
+    - "__name__"
+
+workers:
+  # Number of concurrent worker pods (K8s Jobs)
+  count: 5
+  
+  # Kubernetes namespace for worker pods
+  namespace: "vm-migration"
+  
+  pod:
+    image: "victoriametrics/vmctl:latest"
+    image_pull_policy: "IfNotPresent"
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+    service_account: "vm-migrator-worker"
+  
+  vmctl:
+    concurrency: 2
+    rate_limit: 0              # bytes/sec, 0 = unlimited
+    disable_binary_protocol: false
+    disable_http_keep_alive: false
+    backoff_retries: 10
+
+retry:
+  max_retries: 3
+  auto_resplit: true
+  resplit_factor: 0.5
+
+logging:
+  progress_interval: "30s"
+  level: "info"
+  report_file: "migration_report.json"
+
+monitoring:
+  enabled: true
+  address: ":9090"
+
+# Exclude these metrics entirely (regex patterns)
+exclude_metrics:
+  - "vm_.*"
+
+# Per-metric overrides
+# metric_overrides:
+#   "http_request_duration_seconds_bucket":
+#     max_series_per_task: 50000
+#     preferred_split_labels: ["le", "instance"]

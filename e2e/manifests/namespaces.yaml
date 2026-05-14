@@ -1,0 +1,21 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e-source
+  labels:
+    app: vm-migrator-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e-dest
+  labels:
+    app: vm-migrator-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vm-migration
+  labels:
+    app: vm-migrator-e2e

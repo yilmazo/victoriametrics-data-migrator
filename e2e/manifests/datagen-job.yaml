@@ -1,0 +1,39 @@
+---
+# Data generator Job - runs once to populate the source VictoriaMetrics
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e-datagen
+  namespace: e2e-source
+  labels:
+    app: vm-migrator-e2e
+    component: datagen
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: vm-migrator-e2e
+        component: datagen
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: datagen
+          image: localhost/vm-migrator-e2e:latest
+          imagePullPolicy: Never
+          command: ["datagen"]
+          env:
+            - name: VM_URL
+              value: "http://source-vm.e2e-source.svc.cluster.local:8428"
+            - name: DAYS
+              value: "3"
+            - name: INTERVAL_MINUTES
+              value: "30"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"

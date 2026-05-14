@@ -1,0 +1,44 @@
+---
+# Migrator coordinator Job - runs vm-migrator to orchestrate the migration
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e-migrator
+  namespace: vm-migration
+  labels:
+    app: vm-migrator-e2e
+    component: coordinator
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: vm-migrator-e2e
+        component: coordinator
+    spec:
+      restartPolicy: Never
+      serviceAccountName: vm-migrator-coordinator
+      containers:
+        - name: vm-migrator
+          image: localhost/vm-migrator-e2e:latest
+          imagePullPolicy: Never
+          command:
+            - vm-migrator
+            - migrate
+            - --config=/config/config.yaml
+            - --log-level=debug
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+      volumes:
+        - name: config
+          configMap:
+            name: e2e-migrator-config

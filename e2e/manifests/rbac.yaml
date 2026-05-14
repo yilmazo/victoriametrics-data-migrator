@@ -1,0 +1,46 @@
+---
+# RBAC for vm-migrator e2e test
+# The coordinator (running as a Job in vm-migration namespace)
+# needs to create/watch/delete worker Jobs.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-migrator-coordinator
+  namespace: vm-migration
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-migrator-worker
+  namespace: vm-migration
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vm-migrator-coordinator
+  namespace: vm-migration
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vm-migrator-coordinator-binding
+  namespace: vm-migration
+subjects:
+  - kind: ServiceAccount
+    name: vm-migrator-coordinator
+    namespace: vm-migration
+roleRef:
+  kind: Role
+  name: vm-migrator-coordinator
+  apiGroup: rbac.authorization.k8s.io

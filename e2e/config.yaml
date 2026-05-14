@@ -1,0 +1,71 @@
+# E2E test migration config
+# Uses in-cluster service DNS names since coordinator runs inside the cluster.
+# The source VM is in e2e-source namespace, dest VM is in e2e-dest namespace.
+
+source:
+  # Single-node VictoriaMetrics uses the same port for all APIs
+  vmselect_url: "http://source-vm.e2e-source.svc.cluster.local:8428"
+
+destination:
+  vminsert_url: "http://dest-vm.e2e-dest.svc.cluster.local:8428"
+
+migration:
+  # Match only our e2e test metrics
+  filter_match: '{__name__=~"e2e_.*"}'
+
+  # These will be replaced at runtime by run_e2e.sh based on datagen output
+  start_date: "REPLACE_START_DATE"
+  end_date: "REPLACE_END_DATE"
+
+  time_step: "day"
+  reverse_order: true
+
+splitting:
+  # Set intentionally low to FORCE splitting of the 10,000-series metric
+  max_series_per_task: 500
+
+  safety_margin: 0.2
+  max_regex_values: 100
+
+  preferred_split_labels:
+    - "instance"
+    - "pod"
+
+  exclude_split_labels:
+    - "__name__"
+
+workers:
+  count: 3
+  namespace: "vm-migration"
+
+  pod:
+    image: "victoriametrics/vmctl:v1.118.0"
+    image_pull_policy: "IfNotPresent"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    service_account: "vm-migrator-worker"
+
+  vmctl:
+    concurrency: 1
+    rate_limit: 0
+    disable_binary_protocol: false
+    disable_http_keep_alive: false
+    backoff_retries: 5
+
+retry:
+  max_retries: 2
+  auto_resplit: true
+  resplit_factor: 0.5
+
+logging:
+  progress_interval: "10s"
+  level: "debug"
+  report_file: "/tmp/migration_report.json"
+
+monitoring:
+  enabled: false
