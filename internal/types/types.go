@@ -35,6 +35,7 @@ type Task struct {
 	StartedAt      *time.Time `json:"started_at,omitempty" yaml:"started_at,omitempty"`
 	CompletedAt    *time.Time `json:"completed_at,omitempty" yaml:"completed_at,omitempty"`
 	BytesTransferred int64   `json:"bytes_transferred,omitempty" yaml:"bytes_transferred,omitempty"`
+	SplitAttempted bool       `json:"split_attempted,omitempty" yaml:"split_attempted,omitempty"`
 }
 
 // TimeRange represents a time interval [Start, End).

@@ -10,7 +10,7 @@ The official `vmctl` tool splits work **by metric name only**. When a metric has
 
 `victoriametrics-data-migrator` solves both problems:
 
-1. **Intelligent series splitting** — Analyzes metric cardinality using VictoriaMetrics APIs and recursively partitions high-cardinality metrics by label values, ensuring each task handles a manageable number of series
+1. **Optimistic migration with reactive splitting** — Starts migrating immediately without expensive upfront analysis. If a task fails due to high cardinality, it automatically splits the metric by label values and retries
 2. **Distributed execution** — Spawns Kubernetes Jobs running `vmctl` across multiple worker pods, processing tasks in parallel
 
 ## How It Works
@@ -19,15 +19,19 @@ The official `vmctl` tool splits work **by metric name only**. When a metric has
 1. Parse YAML config
 2. Split time range into intervals (day/hour/month), newest first
 3. For each interval:
-   a. Discover metrics matching the selector
-   b. For each metric:
-      - Check series count via /api/v1/status/tsdb
-      - If under limit: create 1 task
-      - If over limit: recursively split by label values using bin-packing
-   c. Create K8s Jobs (up to worker_count concurrent)
-   d. Track progress, retry failures, optionally re-split
+   a. Discover metric names matching the selector
+   b. Create 1 task per metric (no upfront cardinality analysis)
+   c. Launch K8s Jobs (up to worker_count concurrent)
+   d. On task failure:
+      - Check if failure is cardinality-related (maxSeries, timeout, OOM)
+      - Fast count via count() query to confirm high cardinality
+      - Split by label values using TSDB API + bin-packing
+      - Re-queue sub-tasks
+   e. Track progress, retry non-cardinality failures
 4. Generate final report
 ```
+
+This **optimistic** approach avoids expensive `/api/v1/status/tsdb` calls for the vast majority of metrics (which are low-cardinality and migrate fine without splitting). Only the small fraction of metrics that actually fail get analyzed and split.
 
 ## Quick Start
 
@@ -87,11 +91,15 @@ See [deploy/examples/config.yaml](deploy/examples/config.yaml) for a fully docum
 
 ## Series Splitting Algorithm
 
-1. Query `/api/v1/status/tsdb` with `focusLabel` to get series distribution per label value
-2. Pick the label with the best splitting characteristics (most values, even distribution)
-3. Bin-pack label values into groups ≤ `max_series_per_task`
-4. Generate PromQL selectors with `=~` regex matchers
-5. If any single label value still exceeds the limit, recurse with the next label
+Splitting is triggered **reactively** when a vmctl task fails due to high cardinality:
+
+1. Fast pre-check using `count({selector})` to confirm the metric exceeds `max_series_per_task`
+2. Query `/api/v1/status/tsdb` with `focusLabel` to get series distribution per label value
+3. Pick the label with the best splitting characteristics (most values, even distribution)
+4. Bin-pack label values into groups ≤ `max_series_per_task`
+5. Generate PromQL selectors with `=~` regex matchers
+6. If any single label value still exceeds the limit, recurse with the next label
+7. Sub-tasks are marked `SplitAttempted` to prevent infinite resplitting
 
 ## Monitoring
 

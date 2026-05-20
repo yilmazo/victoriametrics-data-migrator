@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -162,18 +163,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			zap.String("range", tr.String()),
 		)
 
-		// 4b: For each metric, split and create tasks
+		// 4b: For each metric, create a single optimistic task (no API calls)
 		var rangeTasks []*types.Task
 		for _, metric := range metrics {
-			tasks, err := o.createTasksForMetric(ctx, metric, tr)
-			if err != nil {
-				o.logger.Error("Failed to create tasks for metric",
-					zap.String("metric", metric),
-					zap.Error(err),
-				)
-				continue
-			}
-			rangeTasks = append(rangeTasks, tasks...)
+			task := o.createTasksForMetric(metric, tr)
+			rangeTasks = append(rangeTasks, task)
+			intmetrics.SplitOperations.WithLabelValues("no_split").Inc()
 		}
 
 		totalMetricsProcessed += len(metrics)
@@ -242,47 +237,148 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	return nil
 }
 
-// createTasksForMetric discovers cardinality and splits a metric into tasks.
-func (o *Orchestrator) createTasksForMetric(ctx context.Context, metric string, tr types.TimeRange) ([]*types.Task, error) {
-	maxSeries := o.cfg.EffectiveMaxSeriesForMetric(metric)
-
-	// Extract base selector from filter_match (removing __name__ part if any)
+// createTasksForMetric creates a single optimistic task per metric.
+// No cardinality analysis is done upfront — if the task fails due to high
+// cardinality, it will be split reactively (see resplitFailedTask).
+func (o *Orchestrator) createTasksForMetric(metric string, tr types.TimeRange) *types.Task {
 	baseSelector := extractBaseSelector(o.cfg.Migration.FilterMatch)
+	selector := buildOptimisticSelector(metric, baseSelector)
 
-	result, err := o.splitter.SplitMetric(ctx, metric, baseSelector, maxSeries, tr.Start, tr.End)
+	o.taskCounter++
+	return &types.Task{
+		ID:         fmt.Sprintf("t%d", o.taskCounter),
+		MetricName: metric,
+		Selector:   selector,
+		TimeStart:  tr.Start,
+		TimeEnd:    tr.End,
+		Status:     types.TaskStatusPending,
+		MaxRetries: o.cfg.Retry.MaxRetries,
+	}
+}
+
+// buildOptimisticSelector creates a simple {__name__="metric"} selector,
+// optionally including extra matchers from the base filter.
+func buildOptimisticSelector(metric string, baseSelector string) string {
+	sel := strings.TrimSpace(baseSelector)
+	sel = strings.TrimPrefix(sel, "{")
+	sel = strings.TrimSuffix(sel, "}")
+	sel = strings.TrimSpace(sel)
+
+	if sel != "" {
+		return fmt.Sprintf(`{__name__="%s",%s}`, metric, sel)
+	}
+	return fmt.Sprintf(`{__name__="%s"}`, metric)
+}
+
+// isCardinalityError returns true if the HTTP status code indicates that
+// VictoriaMetrics rejected the request due to search.maxSeries being exceeded.
+// VM returns HTTP 422 in this case.
+func isCardinalityError(httpStatus int) bool {
+	return httpStatus == 422
+}
+
+// extractHTTPStatusCode parses vmctl log output and extracts the HTTP status
+// code from error lines. vmctl typically logs errors like:
+//
+//	"unexpected status code: 422"
+//	"got unexpected response status 422"
+//	"status code 422"
+//
+// Returns 0 if no HTTP status code is found.
+func extractHTTPStatusCode(logs string) int {
+	if logs == "" {
+		return 0
+	}
+
+	// Match patterns like "status code: 422", "status 422", "status code 422"
+	re := regexp.MustCompile(`(?i)status[\s_]*(?:code)?[\s:]*(\d{3})`)
+	matches := re.FindAllStringSubmatch(logs, -1)
+
+	// Return the last match (most relevant, closest to the error)
+	for i := len(matches) - 1; i >= 0; i-- {
+		code, err := strconv.Atoi(matches[i][1])
+		if err == nil && code >= 400 {
+			return code
+		}
+	}
+
+	return 0
+}
+
+// resplitFailedTask handles a task that failed due to high cardinality.
+// It uses the fast count() API to confirm cardinality, then falls back to
+// the TSDB status API only for the specific metric that needs splitting.
+// Returns the new sub-tasks, or nil if resplitting was not possible.
+func (o *Orchestrator) resplitFailedTask(ctx context.Context, task *types.Task) ([]*types.Task, error) {
+	maxSeries := o.cfg.EffectiveMaxSeriesForMetric(task.MetricName)
+
+	// Step 1: Fast cardinality check using count() query
+	fastCount, err := o.client.GetSeriesCountFast(ctx, task.Selector, task.TimeEnd)
 	if err != nil {
-		return nil, err
+		o.logger.Warn("Fast count failed, proceeding with split anyway",
+			zap.String("metric", task.MetricName),
+			zap.Error(err),
+		)
+		fastCount = maxSeries + 1 // assume it needs splitting
 	}
 
-	if len(result.Selectors) == 1 {
-		intmetrics.SplitOperations.WithLabelValues("no_split").Inc()
-	} else {
-		intmetrics.SplitOperations.WithLabelValues("split").Inc()
-	}
-
-	o.logger.Info("Metric split result",
-		zap.String("metric", metric),
-		zap.Int("total_series", result.TotalSeries),
-		zap.Int("tasks", len(result.Selectors)),
+	o.logger.Info("Fast cardinality check for failed task",
+		zap.String("task_id", task.ID),
+		zap.String("metric", task.MetricName),
+		zap.Int("fast_count", fastCount),
+		zap.Int("max_series", maxSeries),
 	)
 
-	var tasks []*types.Task
+	if fastCount <= maxSeries {
+		// Not a cardinality issue — don't split, let normal retry handle it
+		o.logger.Info("Series count within limits, not a cardinality issue",
+			zap.String("task_id", task.ID),
+			zap.Int("count", fastCount),
+		)
+		return nil, nil
+	}
+
+	// Step 2: Use the full splitter (TSDB API) only for this specific metric
+	baseSelector := extractBaseSelector(o.cfg.Migration.FilterMatch)
+	result, err := o.splitter.SplitMetric(ctx, task.MetricName, baseSelector, maxSeries, task.TimeStart, task.TimeEnd)
+	if err != nil {
+		return nil, fmt.Errorf("splitting metric %s: %w", task.MetricName, err)
+	}
+
+	if len(result.Selectors) <= 1 {
+		o.logger.Warn("Splitter could not break metric into smaller pieces",
+			zap.String("metric", task.MetricName),
+			zap.Int("total_series", result.TotalSeries),
+		)
+		return nil, nil
+	}
+
+	o.logger.Info("Metric split into sub-tasks",
+		zap.String("metric", task.MetricName),
+		zap.Int("total_series", result.TotalSeries),
+		zap.Int("sub_tasks", len(result.Selectors)),
+	)
+
+	intmetrics.SplitOperations.WithLabelValues("split").Inc()
+
+	var subTasks []*types.Task
 	for _, sel := range result.Selectors {
 		o.taskCounter++
-		task := &types.Task{
+		subTask := &types.Task{
 			ID:             fmt.Sprintf("t%d", o.taskCounter),
-			MetricName:     metric,
+			MetricName:     task.MetricName,
 			Selector:       sel.Selector,
-			TimeStart:      tr.Start,
-			TimeEnd:        tr.End,
+			TimeStart:      task.TimeStart,
+			TimeEnd:        task.TimeEnd,
 			EstSeriesCount: sel.EstSeriesCount,
 			Status:         types.TaskStatusPending,
 			MaxRetries:     o.cfg.Retry.MaxRetries,
+			SplitAttempted: true, // prevent re-splitting these sub-tasks
 		}
-		tasks = append(tasks, task)
+		subTasks = append(subTasks, subTask)
 	}
 
-	return tasks, nil
+	return subTasks, nil
 }
 
 // executeTasks runs tasks from the queue using K8s Jobs, maintaining
@@ -360,18 +456,65 @@ func (o *Orchestrator) executeTasks(ctx context.Context) error {
 				intmetrics.TasksTotal.WithLabelValues("succeeded").Inc()
 				intmetrics.BytesTransferred.Add(float64(bytesTransferred))
 			} else {
+				// Always fetch job logs to get the actual error details
+				logs, logErr := o.workerMgr.GetJobLogs(ctx, job.Name)
 				reason := worker.JobFailureReason(job)
+
+				if logErr == nil && logs != "" {
+					// Extract last meaningful line from logs as reason
+					for _, line := range reverseLines(logs) {
+						line = strings.TrimSpace(line)
+						if line != "" && !strings.HasPrefix(line, "VictoriaMetrics") {
+							reason = line
+							break
+						}
+					}
+				}
+
+				// Extract HTTP status code from vmctl logs
+				httpStatus := extractHTTPStatusCode(logs)
+
 				o.logger.Warn("Task failed",
 					zap.String("task_id", taskID),
 					zap.String("job", job.Name),
 					zap.String("reason", reason),
+					zap.Int("http_status", httpStatus),
 				)
 
-				retrying := o.queue.FailTask(taskID, reason)
-				if retrying {
-					intmetrics.TaskRetries.Inc()
+				// Resplit only on HTTP 422 (search.maxSeries exceeded)
+				task := o.queue.GetTask(taskID)
+				if task != nil && !task.SplitAttempted && isCardinalityError(httpStatus) {
+					o.logger.Info("HTTP 422 received — metric exceeds search.maxSeries, resplitting",
+						zap.String("task_id", taskID),
+						zap.String("metric", task.MetricName),
+					)
+
+					subTasks, splitErr := o.resplitFailedTask(ctx, task)
+					if splitErr != nil {
+						o.logger.Error("Resplit failed", zap.String("task_id", taskID), zap.Error(splitErr))
+					}
+
+					if len(subTasks) > 0 {
+						// Replace the failed task with sub-tasks
+						o.queue.ReplaceTasks(taskID, subTasks)
+						intmetrics.TasksTotal.WithLabelValues("resplit").Inc()
+					} else {
+						// Resplit didn't help — fall through to normal retry
+						retrying := o.queue.FailTask(taskID, reason)
+						if retrying {
+							intmetrics.TaskRetries.Inc()
+						} else {
+							intmetrics.TasksTotal.WithLabelValues("abandoned").Inc()
+						}
+					}
 				} else {
-					intmetrics.TasksTotal.WithLabelValues("abandoned").Inc()
+					// Normal retry (not a 422, or already split)
+					retrying := o.queue.FailTask(taskID, reason)
+					if retrying {
+						intmetrics.TaskRetries.Inc()
+					} else {
+						intmetrics.TasksTotal.WithLabelValues("abandoned").Inc()
+					}
 				}
 			}
 
@@ -587,4 +730,13 @@ func parseHumanBytes(s string) int64 {
 	}
 
 	return 0
+}
+
+// reverseLines returns the lines of a string in reverse order.
+func reverseLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines
 }

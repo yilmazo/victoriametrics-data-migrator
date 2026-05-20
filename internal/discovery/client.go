@@ -254,12 +254,69 @@ func (c *Client) GetTSDBStatus(ctx context.Context, match string, focusLabel str
 
 // GetSeriesCount returns the total number of series matching a selector
 // for the given time range. It uses the TSDB status endpoint.
+// Note: This is expensive on large datasets. Prefer GetSeriesCountFast for quick checks.
 func (c *Client) GetSeriesCount(ctx context.Context, match string, start, end time.Time) (int, error) {
 	status, err := c.GetTSDBStatus(ctx, match, "", 1, start, end)
 	if err != nil {
 		return 0, err
 	}
 	return status.TotalSeries, nil
+}
+
+// GetSeriesCountFast returns an approximate series count using a lightweight
+// /api/v1/query?query=count({selector}) call. This is orders of magnitude
+// faster than the TSDB status endpoint (~100ms vs ~30s) and sufficient for
+// deciding whether a metric needs splitting.
+func (c *Client) GetSeriesCountFast(ctx context.Context, match string, end time.Time) (int, error) {
+	query := fmt.Sprintf("count(%s)", match)
+
+	params := url.Values{}
+	params.Set("query", query)
+	if !end.IsZero() {
+		params.Set("time", strconv.FormatInt(end.Unix(), 10))
+	}
+	// Use a large step to avoid unnecessary processing
+	params.Set("step", "86400")
+
+	body, err := c.doRequest(ctx, "/api/v1/query", params)
+	if err != nil {
+		return 0, fmt.Errorf("fast series count for %s: %w", match, err)
+	}
+
+	var resp apiResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, fmt.Errorf("parsing fast count response: %w", err)
+	}
+	if resp.Status != "success" {
+		return 0, fmt.Errorf("API error in fast count: %s", resp.Error)
+	}
+
+	// Parse the instant query result: {"resultType":"vector","result":[{"value":[ts,"count"]}]}
+	var queryResult struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Value []json.RawMessage `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp.Data, &queryResult); err != nil {
+		return 0, fmt.Errorf("parsing fast count data: %w", err)
+	}
+
+	if len(queryResult.Result) == 0 || len(queryResult.Result[0].Value) < 2 {
+		return 0, nil // No series found
+	}
+
+	var countStr string
+	if err := json.Unmarshal(queryResult.Result[0].Value[1], &countStr); err != nil {
+		return 0, fmt.Errorf("parsing count value: %w", err)
+	}
+
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return 0, fmt.Errorf("converting count %q to int: %w", countStr, err)
+	}
+
+	return count, nil
 }
 
 // GetSeriesDistribution returns the series count per value of a given label,

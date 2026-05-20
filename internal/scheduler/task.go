@@ -61,6 +61,32 @@ func (q *TaskQueue) NextTask() *types.Task {
 	return task
 }
 
+// GetTask returns a task by ID from any state (running, pending, done, failed).
+func (q *TaskQueue) GetTask(taskID string) *types.Task {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if t, ok := q.running[taskID]; ok {
+		return t
+	}
+	for _, t := range q.pending {
+		if t.ID == taskID {
+			return t
+		}
+	}
+	for _, t := range q.done {
+		if t.ID == taskID {
+			return t
+		}
+	}
+	for _, t := range q.failed {
+		if t.ID == taskID {
+			return t
+		}
+	}
+	return nil
+}
+
 // CompleteTask marks a task as succeeded.
 func (q *TaskQueue) CompleteTask(taskID string, bytesTransferred int64) {
 	q.mu.Lock()
