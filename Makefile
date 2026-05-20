@@ -3,7 +3,7 @@ MODULE=github.com/yilmazo/victoriametrics-data-migrator
 VERSION?=dev
 LDFLAGS=-ldflags "-X main.version=$(VERSION)"
 
-.PHONY: all build test lint clean run help e2e e2e-cleanup
+.PHONY: all build test lint clean run help e2e e2e-cleanup proto
 
 all: lint test build ## Run lint, test, and build
 
@@ -36,7 +36,13 @@ dry-run: build ## Build and run in dry-run mode
 	./bin/$(BINARY_NAME) migrate --config deploy/examples/config.yaml --dry-run
 
 docker-build: ## Build Docker image
-	docker build -t $(BINARY_NAME):$(VERSION) .
+	docker build -t $(BINARY_NAME):$(VERSION) -f e2e/Dockerfile .
+
+proto: ## Generate Go code from proto files
+	PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+		--go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		proto/worker.proto
 
 e2e: ## Run end-to-end tests (requires minikube)
 	./e2e/run_e2e.sh

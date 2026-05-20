@@ -1,69 +1,69 @@
-# vm-migrator example configuration
-# Copy this file and adjust values for your environment.
+# vm-migrator configuration example
+# See README.md for full documentation of all options.
 
 source:
-  vmselect_url: "http://vmselect.source.svc:8481/select/0/prometheus"
-  # bearer_token: "your-token-here"
+  vmselect_url: "http://vmselect-source:8481/select/0/prometheus"
+  # bearer_token: "your-token"
   # basic_auth:
   #   username: "user"
   #   password: "pass"
   # headers:
   #   X-Custom-Header: "value"
-  tls:
-    insecure_skip_verify: false
+  # tls:
+  #   insecure_skip_verify: false
+  #   ca_file: "/path/to/ca.crt"
+  #   cert_file: "/path/to/client.crt"
+  #   key_file: "/path/to/client.key"
 
 destination:
-  vminsert_url: "http://vminsert.dest.svc:8480/insert/0/prometheus"
-  tls:
-    insecure_skip_verify: false
+  vminsert_url: "http://vminsert-dest:8480/insert/0/prometheus"
+  # bearer_token: "your-token"
+  # basic_auth:
+  #   username: "user"
+  #   password: "pass"
+  # tls:
+  #   insecure_skip_verify: false
 
 migration:
-  # PromQL selector to match metrics to migrate
-  # This example migrates everything except VM internal metrics
-  filter_match: '{__name__!~"vm_.*"}'
-  
-  # Time range to migrate (DD.MM.YYYY or RFC3339 format)
-  start_date: "13.01.2026"
-  end_date: "13.05.2026"
-  
-  # How to split the time range: "day", "hour", or "month"
-  time_step: "day"
-  
-  # Process time ranges from newest to oldest
-  reverse_order: true
+  filter_match: '{__name__=~".*"}'
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  time_step: "day"         # day, hour, or month
+  reverse_order: true      # newest first
+
+# exclude_metrics:
+#   - "unwanted_metric_.*"
+#   - "another_pattern"
 
 splitting:
-  # Maximum series count per vmctl task
   max_series_per_task: 100000
-  
-  # Safety margin (effective_max = max_series * (1 - safety_margin))
   safety_margin: 0.2
-  
-  # Max label values in a single regex matcher
-  max_regex_values: 200
-  
-  # Labels to prefer when choosing split dimension (tried in order)
+  max_regex_values: 100
   preferred_split_labels:
     - "instance"
     - "pod"
     - "namespace"
-    - "le"
-    - "job"
-  
-  # Labels to never split by
   exclude_split_labels:
     - "__name__"
 
 workers:
-  # Number of concurrent worker pods (K8s Jobs)
+  # Number of concurrent worker pods
   count: 5
-  
+
   # Kubernetes namespace for worker pods
   namespace: "vm-migration"
-  
+
+  # gRPC port workers listen on
+  grpc_port: 9091
+
   pod:
-    image: "victoriametrics/vmctl:latest"
+    # Image containing both vm-migrator and vmctl binaries
+    image: "vm-migrator:latest"
     image_pull_policy: "IfNotPresent"
+
+    # Path to vmctl binary inside the worker container
+    vmctl_path: "/usr/local/bin/vmctl"
+
     resources:
       requests:
         cpu: "500m"
@@ -71,8 +71,15 @@ workers:
       limits:
         cpu: "2"
         memory: "2Gi"
+    # node_selector:
+    #   node-role: "worker"
+    # tolerations:
+    #   - key: "dedicated"
+    #     operator: "Equal"
+    #     value: "migration"
+    #     effect: "NoSchedule"
     service_account: "vm-migrator-worker"
-  
+
   vmctl:
     concurrency: 2
     rate_limit: 0              # bytes/sec, 0 = unlimited

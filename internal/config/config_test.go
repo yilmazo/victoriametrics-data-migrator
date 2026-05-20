@@ -83,6 +83,15 @@ logging:
 	if cfg.Workers.Count != 5 {
 		t.Errorf("unexpected worker count: %d", cfg.Workers.Count)
 	}
+	if cfg.Workers.GRPCPort != 9091 {
+		t.Errorf("unexpected gRPC port: %d", cfg.Workers.GRPCPort)
+	}
+	if cfg.Workers.Pod.Image != "vm-migrator:latest" {
+		t.Errorf("unexpected worker image: %s", cfg.Workers.Pod.Image)
+	}
+	if cfg.Workers.Pod.VmctlPath != "/usr/local/bin/vmctl" {
+		t.Errorf("unexpected vmctl path: %s", cfg.Workers.Pod.VmctlPath)
+	}
 	if cfg.EffectiveMaxSeries() != 80000 {
 		t.Errorf("unexpected effective max series: %d", cfg.EffectiveMaxSeries())
 	}

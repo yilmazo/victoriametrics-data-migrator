@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package worker;
+
+option go_package = "github.com/yilmazo/victoriametrics-data-migrator/proto/workerpb";
+
+// WorkerService is the gRPC service exposed by each worker pod.
+// The coordinator calls these RPCs to dispatch migration tasks and check health.
+service WorkerService {
+  // ExecuteTask runs a vmctl migration task as a subprocess.
+  // Blocks until vmctl exits and returns the result.
+  rpc ExecuteTask(TaskRequest) returns (TaskResponse);
+
+  // Ping checks if the worker is alive and ready to accept tasks.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// TaskRequest contains the vmctl command-line arguments to execute.
+// The coordinator pre-builds the full argument list so the worker
+// is a simple executor with no config awareness.
+message TaskRequest {
+  string task_id = 1;
+  repeated string vmctl_args = 2;
+}
+
+// TaskResponse contains the result of a vmctl execution.
+message TaskResponse {
+  int32 exit_code = 1;
+  string logs = 2;
+  string error_message = 3;
+  int64 bytes_transferred = 4;
+}
+
+// PingRequest is an empty health check request.
+message PingRequest {}
+
+// PingResponse returns the worker's identity.
+message PingResponse {
+  string worker_id = 1;
+}

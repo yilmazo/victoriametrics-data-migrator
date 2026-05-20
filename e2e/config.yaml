@@ -1,6 +1,5 @@
-# E2E test migration config
-# Uses in-cluster service DNS names since coordinator runs inside the cluster.
-# The source VM is in e2e-source namespace, dest VM is in e2e-dest namespace.
+# E2E test configuration for vm-migrator
+# This config is processed by run_e2e.sh which replaces date placeholders.
 
 source:
   # Single-node VictoriaMetrics uses the same port for all APIs
@@ -21,8 +20,10 @@ migration:
   reverse_order: true
 
 splitting:
-  # Set intentionally low to FORCE splitting of the 10,000-series metric
-  max_series_per_task: 500
+  # Source VM has search.maxExportSeries=5000.
+  # e2e_requests_total has 10,000 series, so the first attempt will hit HTTP 422.
+  # The splitter will then break it into sub-tasks ≤ 2000 series each.
+  max_series_per_task: 2000
 
   safety_margin: 0.2
   max_regex_values: 100
@@ -37,10 +38,13 @@ splitting:
 workers:
   count: 3
   namespace: "vm-migration"
+  grpc_port: 9091
 
   pod:
-    image: "victoriametrics/vmctl:v1.118.0"
-    image_pull_policy: "IfNotPresent"
+    # Same image as coordinator — single binary for both roles
+    image: "localhost/vm-migrator-e2e:latest"
+    image_pull_policy: "Never"
+    vmctl_path: "/usr/local/bin/vmctl"
     resources:
       requests:
         cpu: "100m"

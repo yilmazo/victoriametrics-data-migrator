@@ -29,8 +29,8 @@ done
 minikube update-context -p "${MINIKUBE_PROFILE}" 2>/dev/null || true
 kubectl config use-context "${MINIKUBE_PROFILE}" 2>/dev/null || true
 
-log "Cleaning up worker jobs..."
-kubectl delete jobs -n vm-migration -l app=vm-migrator --ignore-not-found=true 2>/dev/null || true
+log "Cleaning up worker deployments..."
+kubectl delete deployments -n vm-migration -l app=vm-migrator,component=worker --ignore-not-found=true 2>/dev/null || true
 
 log "Cleaning up migrator job..."
 kubectl delete job e2e-migrator -n vm-migration --ignore-not-found=true 2>/dev/null || true

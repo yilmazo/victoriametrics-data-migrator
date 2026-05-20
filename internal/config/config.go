@@ -80,6 +80,7 @@ type SplittingConfig struct {
 type WorkersConfig struct {
 	Count     int             `yaml:"count"`
 	Namespace string          `yaml:"namespace"`
+	GRPCPort  int             `yaml:"grpc_port"`
 	Pod       PodConfig       `yaml:"pod"`
 	Vmctl     VmctlConfig     `yaml:"vmctl"`
 }
@@ -88,6 +89,7 @@ type WorkersConfig struct {
 type PodConfig struct {
 	Image           string            `yaml:"image"`
 	ImagePullPolicy string            `yaml:"image_pull_policy,omitempty"`
+	VmctlPath       string            `yaml:"vmctl_path,omitempty"`
 	Resources       ResourcesConfig   `yaml:"resources,omitempty"`
 	NodeSelector    map[string]string `yaml:"node_selector,omitempty"`
 	Tolerations     []Toleration      `yaml:"tolerations,omitempty"`
@@ -195,13 +197,19 @@ func applyDefaults(cfg *Config) {
 		cfg.Workers.Namespace = "vm-migration"
 	}
 	if cfg.Workers.Pod.Image == "" {
-		cfg.Workers.Pod.Image = "victoriametrics/vmctl:latest"
+		cfg.Workers.Pod.Image = "vm-migrator:latest"
 	}
 	if cfg.Workers.Pod.ImagePullPolicy == "" {
 		cfg.Workers.Pod.ImagePullPolicy = "IfNotPresent"
 	}
 	if cfg.Workers.Pod.ServiceAccount == "" {
 		cfg.Workers.Pod.ServiceAccount = "vm-migrator-worker"
+	}
+	if cfg.Workers.Pod.VmctlPath == "" {
+		cfg.Workers.Pod.VmctlPath = "/usr/local/bin/vmctl"
+	}
+	if cfg.Workers.GRPCPort == 0 {
+		cfg.Workers.GRPCPort = 9091
 	}
 	if cfg.Workers.Vmctl.Concurrency == 0 {
 		cfg.Workers.Vmctl.Concurrency = 2

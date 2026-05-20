@@ -27,10 +27,12 @@ spec:
             - "--storageDataPath=/storage"
             - "--httpListenAddr=:8428"
             - "--retentionPeriod=12"
-            # Raise limits to support high cardinality e2e test
+            # Keep discovery/TSDB limits high so the coordinator can query metrics
             - "--search.maxSeries=500000"
             - "--search.maxUniqueTimeseries=500000"
-            - "--search.maxExportSeries=500000"
+            # Set export limit LOW to trigger HTTP 422 on high-cardinality metrics.
+            # e2e_requests_total has 10,000 series — this forces the splitting logic.
+            - "--search.maxExportSeries=5000"
           ports:
             - containerPort: 8428
               name: http

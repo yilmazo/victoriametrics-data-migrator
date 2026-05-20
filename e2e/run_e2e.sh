@@ -240,8 +240,8 @@ run_migration() {
 
     # Delete previous migrator job if exists
     kubectl delete job e2e-migrator -n vm-migration --ignore-not-found=true 2>/dev/null
-    # Also clean up any leftover worker jobs
-    kubectl delete jobs -n vm-migration -l app=vm-migrator --ignore-not-found=true 2>/dev/null
+    # Also clean up any leftover worker deployments from previous runs
+    kubectl delete deployments -n vm-migration -l app=vm-migrator,component=worker --ignore-not-found=true 2>/dev/null
 
     log "Starting vm-migrator coordinator..."
     kubectl apply -f "${SCRIPT_DIR}/manifests/migrator-job.yaml"
@@ -333,6 +333,20 @@ verify_migration() {
         fi
     done
 
+    # Verify that splitting was actually triggered
+    log "Checking that splitting logic was exercised..."
+    local coordinator_logs
+    coordinator_logs=$(kubectl logs job/e2e-migrator -n vm-migration 2>/dev/null || echo "")
+
+    if echo "${coordinator_logs}" | grep -q "resplitting"; then
+        local split_count
+        split_count=$(echo "${coordinator_logs}" | grep -c "Metric split into sub-tasks" || echo "0")
+        ok "  Splitting was triggered (${split_count} metric(s) split)"
+    else
+        fail "  Splitting was NOT triggered — e2e test did not exercise splitting logic"
+        all_pass=false
+    fi
+
     echo ""
     header "E2E TEST RESULTS"
     if $all_pass; then
@@ -341,7 +355,8 @@ verify_migration() {
         echo "  ┌──────────────────────────────────────────────┐"
         echo "  │  E2E test PASSED!                            │"
         echo "  │                                              │"
-        echo "  │  ✓ High-cardinality splitting worked         │"
+        echo "  │  ✓ High-cardinality splitting triggered      │"
+        echo "  │  ✓ Split sub-tasks completed successfully    │"
         echo "  │  ✓ Data migrated correctly                   │"
         echo "  │  ✓ Series counts match source/destination    │"
         echo "  └──────────────────────────────────────────────┘"

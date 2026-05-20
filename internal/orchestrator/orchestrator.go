@@ -4,17 +4,16 @@ package orchestrator
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/yilmazo/victoriametrics-data-migrator/internal/config"
 	"github.com/yilmazo/victoriametrics-data-migrator/internal/discovery"
@@ -97,6 +96,15 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 				o.logger.Error("Metrics server error", zap.Error(err))
 			}
 		}()
+	}
+
+	// Deploy worker pool (if not dry run)
+	if !o.dryRun && o.workerMgr != nil {
+		o.logger.Info("Deploying worker pool", zap.Int("count", o.cfg.Workers.Count))
+		if err := o.workerMgr.DeployWorkers(ctx); err != nil {
+			return fmt.Errorf("deploying workers: %w", err)
+		}
+		intmetrics.ActiveWorkers.Set(float64(o.workerMgr.WorkerCount()))
 	}
 
 	// Step 1: Parse time range
@@ -223,15 +231,35 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.logger.Info("Report written", zap.String("file", o.cfg.Logging.ReportFile))
 	}
 
-	// Cleanup
+	// Cleanup workers
 	if o.workerMgr != nil {
-		if err := o.workerMgr.CleanupAll(ctx); err != nil {
-			o.logger.Error("Failed to cleanup worker jobs", zap.Error(err))
+		if err := o.workerMgr.Cleanup(ctx); err != nil {
+			o.logger.Error("Failed to cleanup workers", zap.Error(err))
 		}
 	}
 
+	// Log failed task details so they're visible in kubectl logs
+	if len(report.FailedTaskDetails) > 0 {
+		o.logger.Warn("Permanently failed tasks:")
+		for _, ft := range report.FailedTaskDetails {
+			o.logger.Warn("  Failed task",
+				zap.String("task_id", ft.ID),
+				zap.String("selector", ft.Selector),
+				zap.String("time_range", ft.TimeRange),
+				zap.Int("attempts", ft.Attempts),
+				zap.String("error", ft.Error),
+			)
+		}
+	}
+
+	// Print full report JSON to logs (visible via kubectl logs even after container exit)
+	reportJSON, err := json.MarshalIndent(report, "", "  ")
+	if err == nil {
+		o.logger.Info("Migration report:\n" + string(reportJSON))
+	}
+
 	if report.Abandoned > 0 {
-		return fmt.Errorf("%d tasks failed permanently, see report for details", report.Abandoned)
+		return fmt.Errorf("%d tasks failed permanently, see logs above for details", report.Abandoned)
 	}
 
 	return nil
@@ -270,56 +298,46 @@ func buildOptimisticSelector(metric string, baseSelector string) string {
 	return fmt.Sprintf(`{__name__="%s"}`, metric)
 }
 
-// isCardinalityError returns true if the HTTP status code indicates that
-// VictoriaMetrics rejected the request due to search.maxSeries being exceeded.
-// VM returns HTTP 422 in this case.
-func isCardinalityError(httpStatus int) bool {
-	return httpStatus == 422
-}
-
-// extractHTTPStatusCode parses vmctl log output and extracts the HTTP status
-// code from error lines. vmctl typically logs errors like:
-//
-//	"unexpected status code: 422"
-//	"got unexpected response status 422"
-//	"status code 422"
-//
-// Returns 0 if no HTTP status code is found.
-func extractHTTPStatusCode(logs string) int {
-	if logs == "" {
-		return 0
+// isCardinalityRelatedError checks whether the error output from vmctl
+// indicates that VictoriaMetrics rejected the request due to series limits.
+// VM embeds the actual error text inside vmctl's output — there is no
+// reliable HTTP status code to parse.
+func isCardinalityRelatedError(errorMsg string) bool {
+	if errorMsg == "" {
+		return false
 	}
 
-	// Match patterns like "status code: 422", "status 422", "status code 422"
-	re := regexp.MustCompile(`(?i)status[\s_]*(?:code)?[\s:]*(\d{3})`)
-	matches := re.FindAllStringSubmatch(logs, -1)
+	// Known patterns from VictoriaMetrics error responses:
+	//   "the number of matching timeseries exceeds ..."
+	//   "the number of matching series exceeds ..."
+	//   "...search.maxUniqueTimeseries..."
+	//   "...search.maxSeries..."
+	patterns := []string{
+		"timeseries exceeds",
+		"series exceeds",
+		"search.max",
+	}
 
-	// Return the last match (most relevant, closest to the error)
-	for i := len(matches) - 1; i >= 0; i-- {
-		code, err := strconv.Atoi(matches[i][1])
-		if err == nil && code >= 400 {
-			return code
+	lower := strings.ToLower(errorMsg)
+	for _, p := range patterns {
+		if strings.Contains(lower, strings.ToLower(p)) {
+			return true
 		}
 	}
-
-	return 0
+	return false
 }
 
 // resplitFailedTask handles a task that failed due to high cardinality.
-// It uses the fast count() API to confirm cardinality, then falls back to
-// the TSDB status API only for the specific metric that needs splitting.
-// Returns the new sub-tasks, or nil if resplitting was not possible.
 func (o *Orchestrator) resplitFailedTask(ctx context.Context, task *types.Task) ([]*types.Task, error) {
 	maxSeries := o.cfg.EffectiveMaxSeriesForMetric(task.MetricName)
 
-	// Step 1: Fast cardinality check using count() query
 	fastCount, err := o.client.GetSeriesCountFast(ctx, task.Selector, task.TimeEnd)
 	if err != nil {
 		o.logger.Warn("Fast count failed, proceeding with split anyway",
 			zap.String("metric", task.MetricName),
 			zap.Error(err),
 		)
-		fastCount = maxSeries + 1 // assume it needs splitting
+		fastCount = maxSeries + 1
 	}
 
 	o.logger.Info("Fast cardinality check for failed task",
@@ -330,7 +348,6 @@ func (o *Orchestrator) resplitFailedTask(ctx context.Context, task *types.Task) 
 	)
 
 	if fastCount <= maxSeries {
-		// Not a cardinality issue — don't split, let normal retry handle it
 		o.logger.Info("Series count within limits, not a cardinality issue",
 			zap.String("task_id", task.ID),
 			zap.Int("count", fastCount),
@@ -338,7 +355,6 @@ func (o *Orchestrator) resplitFailedTask(ctx context.Context, task *types.Task) 
 		return nil, nil
 	}
 
-	// Step 2: Use the full splitter (TSDB API) only for this specific metric
 	baseSelector := extractBaseSelector(o.cfg.Migration.FilterMatch)
 	result, err := o.splitter.SplitMetric(ctx, task.MetricName, baseSelector, maxSeries, task.TimeStart, task.TimeEnd)
 	if err != nil {
@@ -373,7 +389,7 @@ func (o *Orchestrator) resplitFailedTask(ctx context.Context, task *types.Task) 
 			EstSeriesCount: sel.EstSeriesCount,
 			Status:         types.TaskStatusPending,
 			MaxRetries:     o.cfg.Retry.MaxRetries,
-			SplitAttempted: true, // prevent re-splitting these sub-tasks
+			SplitAttempted: true,
 		}
 		subTasks = append(subTasks, subTask)
 	}
@@ -381,126 +397,125 @@ func (o *Orchestrator) resplitFailedTask(ctx context.Context, task *types.Task) 
 	return subTasks, nil
 }
 
-// executeTasks runs tasks from the queue using K8s Jobs, maintaining
-// at most worker_count concurrent Jobs.
+// executeTasks dispatches tasks to the worker pool until the queue is complete.
 func (o *Orchestrator) executeTasks(ctx context.Context) error {
-	maxWorkers := o.cfg.Workers.Count
-
-	// Start watching for job completions
-	watcher, err := o.workerMgr.WatchJobs(ctx)
-	if err != nil {
-		return fmt.Errorf("starting job watcher: %w", err)
-	}
-	defer watcher.Stop()
-
-	// Track active jobs
-	activeJobs := make(map[string]string) // jobName -> taskID
-
-	// Fill initial worker pool
-	for len(activeJobs) < maxWorkers {
-		task := o.queue.NextTask()
-		if task == nil {
-			break
-		}
-		if err := o.launchTask(ctx, task, activeJobs); err != nil {
-			o.logger.Error("Failed to launch task", zap.String("task_id", task.ID), zap.Error(err))
-			o.queue.FailTask(task.ID, err.Error())
-		}
+	// Track in-flight tasks
+	type inflightTask struct {
+		task   *types.Task
+		doneCh chan struct{}
 	}
 
-	// Process job events until queue is complete
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	inflight := make(map[string]*inflightTask)
+
+	// Process results channel
+	type taskResult struct {
+		taskID   string
+		result   *worker.TaskResult
+		err      error
+	}
+	resultCh := make(chan taskResult, o.cfg.Workers.Count)
+
+	// dispatchNext tries to dispatch pending tasks to idle workers
+	dispatchNext := func() {
+		for {
+			w := o.workerMgr.AcquireWorker()
+			if w == nil {
+				break // no idle workers
+			}
+
+			task := o.queue.NextTask()
+			if task == nil {
+				o.workerMgr.ReleaseWorker(w)
+				break // no pending tasks
+			}
+
+			mu.Lock()
+			inflight[task.ID] = &inflightTask{task: task}
+			mu.Unlock()
+
+			intmetrics.ActiveWorkers.Set(float64(o.workerMgr.WorkerCount() - o.workerMgr.IdleWorkerCount()))
+
+			wg.Add(1)
+			go func(w2 interface{ /* workerConn */ }, t *types.Task) {
+				defer wg.Done()
+				res, err := o.workerMgr.DispatchTask(ctx, w, t)
+				o.workerMgr.ReleaseWorker(w)
+				resultCh <- taskResult{taskID: t.ID, result: res, err: err}
+			}(w, task)
+		}
+	}
+
+	// Initial dispatch
+	dispatchNext()
+
+	// Process results until queue is complete
 	for !o.queue.IsComplete() {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				// Watcher channel closed, restart it
-				o.logger.Warn("Job watcher closed, restarting")
-				watcher, err = o.workerMgr.WatchJobs(ctx)
-				if err != nil {
-					return fmt.Errorf("restarting job watcher: %w", err)
-				}
-				continue
-			}
+		case r := <-resultCh:
+			mu.Lock()
+			delete(inflight, r.taskID)
+			mu.Unlock()
 
-			if event.Type != watch.Modified {
-				continue
-			}
-
-			job, ok := event.Object.(*batchv1.Job)
-			if !ok {
-				continue
-			}
-
-			if !worker.IsJobComplete(job) {
-				continue
-			}
-
-			taskID := worker.JobTaskID(job)
-			if taskID == "" {
-				continue
-			}
-
-			// Handle job completion
-			if worker.IsJobSucceeded(job) {
-				o.logger.Info("Task succeeded",
-					zap.String("task_id", taskID),
-					zap.String("job", job.Name),
+			if r.err != nil {
+				// gRPC or network error
+				o.logger.Error("Task dispatch error",
+					zap.String("task_id", r.taskID),
+					zap.Error(r.err),
 				)
-
-				// Try to parse bytes from logs
-				bytesTransferred := o.parseJobBytes(ctx, job.Name)
-				o.queue.CompleteTask(taskID, bytesTransferred)
+				retrying := o.queue.FailTask(r.taskID, r.err.Error())
+				if retrying {
+					intmetrics.TaskRetries.Inc()
+				} else {
+					intmetrics.TasksTotal.WithLabelValues("abandoned").Inc()
+				}
+			} else if r.result.ExitCode == 0 {
+				// Success
+				o.logger.Info("Task succeeded",
+					zap.String("task_id", r.taskID),
+					zap.Int64("bytes", r.result.BytesTransferred),
+				)
+				o.queue.CompleteTask(r.taskID, r.result.BytesTransferred)
 				intmetrics.TasksTotal.WithLabelValues("succeeded").Inc()
-				intmetrics.BytesTransferred.Add(float64(bytesTransferred))
+				intmetrics.BytesTransferred.Add(float64(r.result.BytesTransferred))
 			} else {
-				// Always fetch job logs to get the actual error details
-				logs, logErr := o.workerMgr.GetJobLogs(ctx, job.Name)
-				reason := worker.JobFailureReason(job)
-
-				if logErr == nil && logs != "" {
-					// Extract last meaningful line from logs as reason
-					for _, line := range reverseLines(logs) {
-						line = strings.TrimSpace(line)
-						if line != "" && !strings.HasPrefix(line, "VictoriaMetrics") {
-							reason = line
-							break
-						}
-					}
+				// vmctl failed
+				reason := r.result.ErrorMessage
+				if reason == "" {
+					reason = fmt.Sprintf("vmctl exited with code %d", r.result.ExitCode)
 				}
 
-				// Extract HTTP status code from vmctl logs
-				httpStatus := extractHTTPStatusCode(logs)
+				// Check both the error message and the full logs for cardinality patterns
+				cardinalityIssue := isCardinalityRelatedError(r.result.Logs) || isCardinalityRelatedError(reason)
 
 				o.logger.Warn("Task failed",
-					zap.String("task_id", taskID),
-					zap.String("job", job.Name),
+					zap.String("task_id", r.taskID),
 					zap.String("reason", reason),
-					zap.Int("http_status", httpStatus),
+					zap.Bool("cardinality_issue", cardinalityIssue),
+					zap.Int("exit_code", r.result.ExitCode),
 				)
 
-				// Resplit only on HTTP 422 (search.maxSeries exceeded)
-				task := o.queue.GetTask(taskID)
-				if task != nil && !task.SplitAttempted && isCardinalityError(httpStatus) {
-					o.logger.Info("HTTP 422 received — metric exceeds search.maxSeries, resplitting",
-						zap.String("task_id", taskID),
+				task := o.queue.GetTask(r.taskID)
+				if task != nil && !task.SplitAttempted && cardinalityIssue {
+					o.logger.Info("Cardinality limit hit — metric exceeds search.max*, resplitting",
+						zap.String("task_id", r.taskID),
 						zap.String("metric", task.MetricName),
 					)
 
 					subTasks, splitErr := o.resplitFailedTask(ctx, task)
 					if splitErr != nil {
-						o.logger.Error("Resplit failed", zap.String("task_id", taskID), zap.Error(splitErr))
+						o.logger.Error("Resplit failed", zap.String("task_id", r.taskID), zap.Error(splitErr))
 					}
 
 					if len(subTasks) > 0 {
-						// Replace the failed task with sub-tasks
-						o.queue.ReplaceTasks(taskID, subTasks)
+						o.queue.ReplaceTasks(r.taskID, subTasks)
 						intmetrics.TasksTotal.WithLabelValues("resplit").Inc()
 					} else {
-						// Resplit didn't help — fall through to normal retry
-						retrying := o.queue.FailTask(taskID, reason)
+						retrying := o.queue.FailTask(r.taskID, reason)
 						if retrying {
 							intmetrics.TaskRetries.Inc()
 						} else {
@@ -508,8 +523,7 @@ func (o *Orchestrator) executeTasks(ctx context.Context) error {
 						}
 					}
 				} else {
-					// Normal retry (not a 422, or already split)
-					retrying := o.queue.FailTask(taskID, reason)
+					retrying := o.queue.FailTask(r.taskID, reason)
 					if retrying {
 						intmetrics.TaskRetries.Inc()
 					} else {
@@ -518,67 +532,14 @@ func (o *Orchestrator) executeTasks(ctx context.Context) error {
 				}
 			}
 
-			// Clean up job
-			delete(activeJobs, job.Name)
-			intmetrics.ActiveWorkers.Set(float64(len(activeJobs)))
+			intmetrics.ActiveWorkers.Set(float64(o.workerMgr.WorkerCount() - o.workerMgr.IdleWorkerCount()))
 
-			// Delete the completed job
-			if err := o.workerMgr.DeleteJob(ctx, job.Name); err != nil {
-				o.logger.Warn("Failed to delete job", zap.String("job", job.Name), zap.Error(err))
-			}
-
-			// Launch next task if capacity available
-			for len(activeJobs) < maxWorkers {
-				task := o.queue.NextTask()
-				if task == nil {
-					break
-				}
-				if err := o.launchTask(ctx, task, activeJobs); err != nil {
-					o.logger.Error("Failed to launch task", zap.String("task_id", task.ID), zap.Error(err))
-					o.queue.FailTask(task.ID, err.Error())
-				}
-			}
+			// Dispatch more tasks now that a worker is free
+			dispatchNext()
 		}
 	}
 
 	return nil
-}
-
-// launchTask creates a K8s Job for a task and tracks it.
-func (o *Orchestrator) launchTask(ctx context.Context, task *types.Task, activeJobs map[string]string) error {
-	job, err := o.workerMgr.CreateJob(ctx, task)
-	if err != nil {
-		return err
-	}
-
-	activeJobs[job.Name] = task.ID
-	task.WorkerID = job.Name
-	intmetrics.ActiveWorkers.Set(float64(len(activeJobs)))
-
-	return nil
-}
-
-// parseJobBytes tries to extract bytes transferred from vmctl job logs.
-func (o *Orchestrator) parseJobBytes(ctx context.Context, jobName string) int64 {
-	logs, err := o.workerMgr.GetJobLogs(ctx, jobName)
-	if err != nil {
-		o.logger.Debug("Could not get job logs for bytes parsing", zap.Error(err))
-		return 0
-	}
-
-	// vmctl outputs: "total bytes: 7.8 MB"
-	// Simple parsing — can be improved
-	for _, line := range strings.Split(logs, "\n") {
-		if strings.Contains(line, "total bytes:") {
-			parts := strings.Split(line, "total bytes:")
-			if len(parts) > 1 {
-				bytesStr := strings.TrimSpace(parts[1])
-				bytesStr = strings.Split(bytesStr, ";")[0]
-				return parseHumanBytes(bytesStr)
-			}
-		}
-	}
-	return 0
 }
 
 // logDryRunSummary prints a summary of what would be executed.
@@ -608,7 +569,6 @@ func extractBaseSelector(filterMatch string) string {
 	sel = strings.TrimPrefix(sel, "{")
 	sel = strings.TrimSuffix(sel, "}")
 
-	// Split matchers and filter out __name__
 	var matchers []string
 	for _, m := range splitMatchers(sel) {
 		m = strings.TrimSpace(m)
@@ -704,39 +664,4 @@ func generateMigrationID(cfg *config.Config) string {
 	h.Write([]byte(cfg.Migration.EndDate))
 	sum := h.Sum(nil)
 	return fmt.Sprintf("%x", sum[:6])
-}
-
-// parseHumanBytes converts a human-readable bytes string to int64.
-func parseHumanBytes(s string) int64 {
-	s = strings.TrimSpace(s)
-	s = strings.ToUpper(s)
-
-	multipliers := map[string]int64{
-		"TB": 1024 * 1024 * 1024 * 1024,
-		"GB": 1024 * 1024 * 1024,
-		"MB": 1024 * 1024,
-		"KB": 1024,
-		"B":  1,
-	}
-
-	for suffix, mult := range multipliers {
-		if strings.HasSuffix(s, suffix) {
-			numStr := strings.TrimSpace(strings.TrimSuffix(s, suffix))
-			var val float64
-			if _, err := fmt.Sscanf(numStr, "%f", &val); err == nil {
-				return int64(val * float64(mult))
-			}
-		}
-	}
-
-	return 0
-}
-
-// reverseLines returns the lines of a string in reverse order.
-func reverseLines(s string) []string {
-	lines := strings.Split(s, "\n")
-	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
-		lines[i], lines[j] = lines[j], lines[i]
-	}
-	return lines
 }

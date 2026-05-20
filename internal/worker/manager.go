@@ -1,4 +1,4 @@
-// Package worker manages Kubernetes Jobs for executing vmctl migration tasks.
+// Package worker manages the lifecycle of static worker pods and gRPC communication.
 package worker
 
 import (
@@ -6,31 +6,60 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
-	batchv1 "k8s.io/api/batch/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/yilmazo/victoriametrics-data-migrator/internal/config"
 	"github.com/yilmazo/victoriametrics-data-migrator/internal/types"
+	pb "github.com/yilmazo/victoriametrics-data-migrator/proto"
 )
 
-// Manager manages the lifecycle of Kubernetes Jobs that run vmctl.
+const (
+	defaultGRPCPort = 9091
+	grpcDialTimeout = 10 * time.Second
+)
+
+// TaskResult holds the result of a task executed by a worker.
+type TaskResult struct {
+	ExitCode         int
+	Logs             string
+	ErrorMessage     string
+	BytesTransferred int64
+}
+
+// workerConn tracks a gRPC connection to a worker pod.
+type workerConn struct {
+	podName string
+	addr    string
+	conn    *grpc.ClientConn
+	client  pb.WorkerServiceClient
+	busy    bool
+}
+
+// Manager manages the lifecycle of worker pods and gRPC communication.
 type Manager struct {
 	clientset   kubernetes.Interface
 	config      *config.Config
 	namespace   string
 	migrationID string
 	logger      *zap.Logger
+
+	mu      sync.Mutex
+	workers []*workerConn
 }
 
-// NewManager creates a new Kubernetes Job manager.
+// NewManager creates a new worker Manager.
 // It tries in-cluster config first, then falls back to kubeconfig.
 func NewManager(cfg *config.Config, migrationID string, logger *zap.Logger) (*Manager, error) {
 	var restConfig *rest.Config
@@ -63,119 +92,258 @@ func NewManager(cfg *config.Config, migrationID string, logger *zap.Logger) (*Ma
 	}, nil
 }
 
-// CreateJob creates a Kubernetes Job for a migration task.
-func (m *Manager) CreateJob(ctx context.Context, task *types.Task) (*batchv1.Job, error) {
-	job := m.buildJobSpec(task)
+// DeployWorkers creates a Deployment of worker pods and waits for them to become Ready.
+// It then establishes gRPC connections to all worker pods.
+func (m *Manager) DeployWorkers(ctx context.Context) error {
+	deploy := m.buildDeployment()
 
-	created, err := m.clientset.BatchV1().Jobs(m.namespace).Create(ctx, job, metav1.CreateOptions{})
+	m.logger.Info("Creating worker Deployment",
+		zap.String("name", deploy.Name),
+		zap.Int32("replicas", *deploy.Spec.Replicas),
+	)
+
+	_, err := m.clientset.AppsV1().Deployments(m.namespace).Create(ctx, deploy, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("creating job for task %s: %w", task.ID, err)
+		return fmt.Errorf("creating worker deployment: %w", err)
 	}
 
-	m.logger.Info("Created K8s Job",
-		zap.String("job", created.Name),
+	// Wait for all pods to be Ready
+	if err := m.waitForWorkers(ctx); err != nil {
+		return fmt.Errorf("waiting for workers: %w", err)
+	}
+
+	// Discover pod IPs and establish gRPC connections
+	if err := m.connectToWorkers(ctx); err != nil {
+		return fmt.Errorf("connecting to workers: %w", err)
+	}
+
+	m.logger.Info("All workers ready and connected",
+		zap.Int("count", len(m.workers)),
+	)
+
+	return nil
+}
+
+// waitForWorkers polls until the Deployment has the desired number of ready replicas.
+func (m *Manager) waitForWorkers(ctx context.Context) error {
+	deployName := m.deploymentName()
+	desired := int32(m.config.Workers.Count)
+	pollInterval := 2 * time.Second
+	timeout := 5 * time.Minute
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		deploy, err := m.clientset.AppsV1().Deployments(m.namespace).Get(ctx, deployName, metav1.GetOptions{})
+		if err != nil {
+			m.logger.Warn("Failed to check deployment status", zap.Error(err))
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		if deploy.Status.ReadyReplicas >= desired {
+			m.logger.Info("Worker deployment ready",
+				zap.Int32("ready", deploy.Status.ReadyReplicas),
+				zap.Int32("desired", desired),
+			)
+			return nil
+		}
+
+		m.logger.Debug("Waiting for workers to be ready",
+			zap.Int32("ready", deploy.Status.ReadyReplicas),
+			zap.Int32("desired", desired),
+		)
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("timed out waiting for %d workers to be ready (timeout: %s)", desired, timeout)
+}
+
+// connectToWorkers discovers worker pod IPs and establishes gRPC connections.
+func (m *Manager) connectToWorkers(ctx context.Context) error {
+	labelSelector := fmt.Sprintf("app=vm-migrator,component=worker,migration-id=%s", m.migrationID)
+	pods, err := m.clientset.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return fmt.Errorf("listing worker pods: %w", err)
+	}
+
+	port := m.grpcPort()
+
+	for _, pod := range pods.Items {
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if pod.Status.PodIP == "" {
+			continue
+		}
+
+		addr := fmt.Sprintf("%s:%d", pod.Status.PodIP, port)
+		dialCtx, cancel := context.WithTimeout(ctx, grpcDialTimeout)
+		conn, err := grpc.DialContext(dialCtx, addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
+		cancel()
+
+		if err != nil {
+			m.logger.Warn("Failed to connect to worker, skipping",
+				zap.String("pod", pod.Name),
+				zap.String("addr", addr),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		client := pb.NewWorkerServiceClient(conn)
+
+		// Verify the worker is responsive
+		pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+		resp, err := client.Ping(pingCtx, &pb.PingRequest{})
+		pingCancel()
+
+		if err != nil {
+			m.logger.Warn("Worker ping failed, skipping",
+				zap.String("pod", pod.Name),
+				zap.Error(err),
+			)
+			conn.Close()
+			continue
+		}
+
+		m.workers = append(m.workers, &workerConn{
+			podName: pod.Name,
+			addr:    addr,
+			conn:    conn,
+			client:  client,
+		})
+
+		m.logger.Info("Connected to worker",
+			zap.String("pod", pod.Name),
+			zap.String("worker_id", resp.WorkerId),
+			zap.String("addr", addr),
+		)
+	}
+
+	if len(m.workers) == 0 {
+		return fmt.Errorf("no workers available")
+	}
+
+	return nil
+}
+
+// AcquireWorker returns an idle worker connection, or nil if all are busy.
+func (m *Manager) AcquireWorker() *workerConn {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, w := range m.workers {
+		if !w.busy {
+			w.busy = true
+			return w
+		}
+	}
+	return nil
+}
+
+// ReleaseWorker marks a worker as idle.
+func (m *Manager) ReleaseWorker(w *workerConn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w.busy = false
+}
+
+// IdleWorkerCount returns the number of idle workers.
+func (m *Manager) IdleWorkerCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := 0
+	for _, w := range m.workers {
+		if !w.busy {
+			count++
+		}
+	}
+	return count
+}
+
+// WorkerCount returns the total number of connected workers.
+func (m *Manager) WorkerCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.workers)
+}
+
+// DispatchTask sends a task to a specific worker and waits for the result.
+func (m *Manager) DispatchTask(ctx context.Context, w *workerConn, task *types.Task) (*TaskResult, error) {
+	args := m.buildVmctlArgs(task)
+
+	m.logger.Info("Dispatching task to worker",
 		zap.String("task_id", task.ID),
+		zap.String("worker", w.podName),
 		zap.String("selector", task.Selector),
 	)
 
-	return created, nil
-}
-
-// WatchJobs watches for Job completions/failures in the migration namespace.
-func (m *Manager) WatchJobs(ctx context.Context) (watch.Interface, error) {
-	labelSelector := fmt.Sprintf("app=vm-migrator,migration-id=%s", m.migrationID)
-	watcher, err := m.clientset.BatchV1().Jobs(m.namespace).Watch(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
+	resp, err := w.client.ExecuteTask(ctx, &pb.TaskRequest{
+		TaskId:    task.ID,
+		VmctlArgs: args,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("watching jobs: %w", err)
+		return nil, fmt.Errorf("executing task %s on worker %s: %w", task.ID, w.podName, err)
 	}
-	return watcher, nil
+
+	return &TaskResult{
+		ExitCode:         int(resp.ExitCode),
+		Logs:             resp.Logs,
+		ErrorMessage:     resp.ErrorMessage,
+		BytesTransferred: resp.BytesTransferred,
+	}, nil
 }
 
-// GetJobLogs retrieves logs from a completed Job's pod.
-func (m *Manager) GetJobLogs(ctx context.Context, jobName string) (string, error) {
-	// Find pods for this job
-	pods, err := m.clientset.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("job-name=%s", jobName),
-	})
-	if err != nil {
-		return "", fmt.Errorf("listing pods for job %s: %w", jobName, err)
+// Cleanup deletes the worker Deployment and closes all gRPC connections.
+func (m *Manager) Cleanup(ctx context.Context) error {
+	// Close gRPC connections
+	for _, w := range m.workers {
+		if err := w.conn.Close(); err != nil {
+			m.logger.Warn("Failed to close gRPC connection",
+				zap.String("pod", w.podName),
+				zap.Error(err),
+			)
+		}
 	}
 
-	if len(pods.Items) == 0 {
-		return "", fmt.Errorf("no pods found for job %s", jobName)
-	}
-
-	// Get logs from the first pod
-	req := m.clientset.CoreV1().Pods(m.namespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{})
-	result := req.Do(ctx)
-	raw, err := result.Raw()
-	if err != nil {
-		return "", fmt.Errorf("getting logs for job %s: %w", jobName, err)
-	}
-
-	return string(raw), nil
-}
-
-// DeleteJob removes a completed Job and its pods.
-func (m *Manager) DeleteJob(ctx context.Context, jobName string) error {
-	propagation := metav1.DeletePropagationBackground
-	err := m.clientset.BatchV1().Jobs(m.namespace).Delete(ctx, jobName, metav1.DeleteOptions{
+	// Delete the Deployment
+	deployName := m.deploymentName()
+	propagation := metav1.DeletePropagationForeground
+	err := m.clientset.AppsV1().Deployments(m.namespace).Delete(ctx, deployName, metav1.DeleteOptions{
 		PropagationPolicy: &propagation,
 	})
 	if err != nil {
-		return fmt.Errorf("deleting job %s: %w", jobName, err)
+		return fmt.Errorf("deleting worker deployment: %w", err)
 	}
+
+	m.logger.Info("Deleted worker deployment", zap.String("name", deployName))
 	return nil
 }
 
-// CleanupAll removes all Jobs created by this migration.
-func (m *Manager) CleanupAll(ctx context.Context) error {
-	labelSelector := fmt.Sprintf("app=vm-migrator,migration-id=%s", m.migrationID)
-	propagation := metav1.DeletePropagationBackground
-
-	err := m.clientset.BatchV1().Jobs(m.namespace).DeleteCollection(ctx,
-		metav1.DeleteOptions{PropagationPolicy: &propagation},
-		metav1.ListOptions{LabelSelector: labelSelector},
-	)
-	if err != nil {
-		return fmt.Errorf("cleaning up jobs: %w", err)
-	}
-
-	m.logger.Info("Cleaned up all migration jobs", zap.String("migration_id", m.migrationID))
-	return nil
-}
-
-// CountRunningJobs returns the number of currently running Jobs for this migration.
-func (m *Manager) CountRunningJobs(ctx context.Context) (int, error) {
-	labelSelector := fmt.Sprintf("app=vm-migrator,migration-id=%s", m.migrationID)
-	jobs, err := m.clientset.BatchV1().Jobs(m.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("listing jobs: %w", err)
-	}
-
-	running := 0
-	for _, job := range jobs.Items {
-		if job.Status.Active > 0 {
-			running++
-		}
-	}
-	return running, nil
-}
-
-// buildJobSpec constructs a Kubernetes Job specification for a vmctl task.
-func (m *Manager) buildJobSpec(task *types.Task) *batchv1.Job {
+// buildDeployment constructs the K8s Deployment spec for worker pods.
+func (m *Manager) buildDeployment() *appsv1.Deployment {
 	cfg := m.config
-	jobName := fmt.Sprintf("vm-migrator-%s", task.ID)
-	if len(jobName) > 63 {
-		jobName = jobName[:63]
-	}
+	deployName := m.deploymentName()
+	replicas := int32(cfg.Workers.Count)
+	port := int32(m.grpcPort())
 
-	// Build vmctl command arguments
-	args := m.buildVmctlArgs(task)
+	labels := map[string]string{
+		"app":          "vm-migrator",
+		"component":    "worker",
+		"migration-id": m.migrationID,
+	}
 
 	// Build resource requirements
 	resources := corev1.ResourceRequirements{}
@@ -198,47 +366,43 @@ func (m *Manager) buildJobSpec(task *types.Task) *batchv1.Job {
 		}
 	}
 
-	var backoffLimit int32 = 0 // Coordinator handles retries
-	var ttl int32 = 600         // Clean up finished jobs after 10 min
+	workerArgs := []string{
+		"worker",
+		"--port=" + strconv.Itoa(int(port)),
+		"--vmctl-path=" + cfg.Workers.Pod.VmctlPath,
+	}
 
-	job := &batchv1.Job{
+	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
+			Name:      deployName,
 			Namespace: m.namespace,
-			Labels: map[string]string{
-				"app":          "vm-migrator",
-				"component":    "worker",
-				"task-id":      task.ID,
-				"migration-id": m.migrationID,
-			},
-			Annotations: map[string]string{
-				"vm-migrator/metric":    task.MetricName,
-				"vm-migrator/selector":  task.Selector,
-				"vm-migrator/time-start": task.TimeStart.Format("2006-01-02T15:04:05Z"),
-				"vm-migrator/time-end":   task.TimeEnd.Format("2006-01-02T15:04:05Z"),
-			},
+			Labels:    labels,
 		},
-		Spec: batchv1.JobSpec{
-			BackoffLimit:            &backoffLimit,
-			TTLSecondsAfterFinished: &ttl,
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":          "vm-migrator",
-						"component":    "worker",
-						"task-id":      task.ID,
-						"migration-id": m.migrationID,
-					},
+					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyNever,
 					ServiceAccountName: cfg.Workers.Pod.ServiceAccount,
 					Containers: []corev1.Container{
 						{
-							Name:      "vmctl",
+							Name:      "worker",
 							Image:     cfg.Workers.Pod.Image,
-							Args:      args,
+							Command:   []string{"vm-migrator"},
+							Args:      workerArgs,
 							Resources: resources,
+							Ports: []corev1.ContainerPort{
+								{
+									Name:          "grpc",
+									ContainerPort: port,
+									Protocol:      corev1.ProtocolTCP,
+								},
+							},
 						},
 					},
 				},
@@ -246,14 +410,19 @@ func (m *Manager) buildJobSpec(task *types.Task) *batchv1.Job {
 		},
 	}
 
+	// Apply image pull policy
+	if cfg.Workers.Pod.ImagePullPolicy != "" {
+		deploy.Spec.Template.Spec.Containers[0].ImagePullPolicy = corev1.PullPolicy(cfg.Workers.Pod.ImagePullPolicy)
+	}
+
 	// Apply node selector
 	if len(cfg.Workers.Pod.NodeSelector) > 0 {
-		job.Spec.Template.Spec.NodeSelector = cfg.Workers.Pod.NodeSelector
+		deploy.Spec.Template.Spec.NodeSelector = cfg.Workers.Pod.NodeSelector
 	}
 
 	// Apply tolerations
 	for _, tol := range cfg.Workers.Pod.Tolerations {
-		job.Spec.Template.Spec.Tolerations = append(job.Spec.Template.Spec.Tolerations,
+		deploy.Spec.Template.Spec.Tolerations = append(deploy.Spec.Template.Spec.Tolerations,
 			corev1.Toleration{
 				Key:      tol.Key,
 				Operator: corev1.TolerationOperator(tol.Operator),
@@ -262,7 +431,7 @@ func (m *Manager) buildJobSpec(task *types.Task) *batchv1.Job {
 			})
 	}
 
-	return job
+	return deploy
 }
 
 // buildVmctlArgs constructs command-line arguments for vmctl vm-native.
@@ -348,37 +517,19 @@ func (m *Manager) buildVmctlArgs(task *types.Task) []string {
 	return args
 }
 
-// JobTaskID extracts the task ID from a Job's labels.
-func JobTaskID(job *batchv1.Job) string {
-	return job.Labels["task-id"]
-}
-
-// IsJobComplete checks if a Job has completed (succeeded or failed).
-func IsJobComplete(job *batchv1.Job) bool {
-	return IsJobSucceeded(job) || IsJobFailed(job)
-}
-
-// IsJobSucceeded checks if a Job completed successfully.
-func IsJobSucceeded(job *batchv1.Job) bool {
-	return job.Status.Succeeded > 0
-}
-
-// IsJobFailed checks if a Job has failed.
-func IsJobFailed(job *batchv1.Job) bool {
-	for _, c := range job.Status.Conditions {
-		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			return true
-		}
+// deploymentName returns the Deployment name for this migration.
+func (m *Manager) deploymentName() string {
+	name := fmt.Sprintf("vm-migrator-workers-%s", m.migrationID)
+	if len(name) > 63 {
+		name = name[:63]
 	}
-	return false
+	return name
 }
 
-// JobFailureReason extracts the failure reason from a failed Job.
-func JobFailureReason(job *batchv1.Job) string {
-	for _, c := range job.Status.Conditions {
-		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			return c.Message
-		}
+// grpcPort returns the configured gRPC port or the default.
+func (m *Manager) grpcPort() int {
+	if m.config.Workers.GRPCPort > 0 {
+		return m.config.Workers.GRPCPort
 	}
-	return "unknown failure"
+	return defaultGRPCPort
 }

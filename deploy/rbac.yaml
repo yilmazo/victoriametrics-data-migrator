@@ -14,13 +14,13 @@ metadata:
   name: vm-migrator-coordinator
   namespace: vm-migration
 rules:
-  # Manage migration Jobs
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
-  # Read pod status and logs
+  # Manage worker Deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Read pod status for worker discovery
   - apiGroups: [""]
-    resources: ["pods", "pods/log"]
+    resources: ["pods"]
     verbs: ["get", "list", "watch"]
   # Manage state ConfigMaps (optional, for state persistence)
   - apiGroups: [""]

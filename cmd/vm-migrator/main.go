@@ -3,7 +3,7 @@
 //
 // It discovers metrics from a source vmselect, intelligently splits
 // high-cardinality metrics into manageable chunks, and distributes
-// migration work across Kubernetes worker pods running vmctl.
+// migration work across a static pool of worker pods via gRPC.
 package main
 
 import (
@@ -19,13 +19,17 @@ import (
 
 	"github.com/yilmazo/victoriametrics-data-migrator/internal/config"
 	"github.com/yilmazo/victoriametrics-data-migrator/internal/orchestrator"
+	"github.com/yilmazo/victoriametrics-data-migrator/internal/workerserver"
 )
 
 var (
-	version    = "dev"
-	configFile string
-	dryRun     bool
-	logLevel   string
+	version         = "dev"
+	configFile      string
+	dryRun          bool
+	logLevel        string
+	workerPort      int
+	workerVmctlPath string
+	workerLogLevel  string
 )
 
 func main() {
@@ -46,11 +50,12 @@ Kubernetes worker pods running vmctl.`,
 		Long: `Starts the migration process based on the configuration file.
 
 The migration proceeds in these steps:
-1. Split the time range into intervals (day/hour/month)
-2. For each interval, discover metrics matching the selector
-3. Analyze cardinality and split high-cardinality metrics
-4. Create Kubernetes Jobs running vmctl for each task
-5. Track progress and report results`,
+1. Deploy a static pool of worker pods
+2. Split the time range into intervals (day/hour/month)
+3. For each interval, discover metrics matching the selector
+4. Analyze cardinality and split high-cardinality metrics
+5. Dispatch tasks to workers via gRPC
+6. Track progress and report results`,
 		RunE: runMigrate,
 	}
 
@@ -67,7 +72,22 @@ The migration proceeds in these steps:
 
 	statusCmd.Flags().StringVarP(&configFile, "config", "c", "vm-migrator.yaml", "Path to configuration file")
 
-	rootCmd.AddCommand(migrateCmd, statusCmd)
+	workerCmd := &cobra.Command{
+		Use:   "worker",
+		Short: "Run as a worker process (receives tasks from coordinator via gRPC)",
+		Long: `Starts the worker gRPC server that listens for task assignments from the coordinator.
+
+The worker executes vmctl as a subprocess for each task and reports the result
+back to the coordinator. This command is intended to run inside a worker pod
+and is typically not invoked manually.`,
+		RunE: runWorker,
+	}
+
+	workerCmd.Flags().IntVar(&workerPort, "port", 9091, "gRPC listen port")
+	workerCmd.Flags().StringVar(&workerVmctlPath, "vmctl-path", "/usr/local/bin/vmctl", "Path to vmctl binary")
+	workerCmd.Flags().StringVar(&workerLogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
+
+	rootCmd.AddCommand(migrateCmd, statusCmd, workerCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -155,6 +175,34 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runWorker(cmd *cobra.Command, args []string) error {
+	logger, err := newLogger(workerLogLevel)
+	if err != nil {
+		return fmt.Errorf("initializing logger: %w", err)
+	}
+	defer logger.Sync()
+
+	logger.Info("vm-migrator worker starting",
+		zap.String("version", version),
+		zap.Int("port", workerPort),
+		zap.String("vmctl_path", workerVmctlPath),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		logger.Info("Received signal, shutting down worker", zap.String("signal", sig.String()))
+		cancel()
+	}()
+
+	srv := workerserver.NewServer(workerVmctlPath, logger)
+	return srv.Run(ctx, workerPort)
 }
 
 // newLogger creates a zap logger with the specified level.
