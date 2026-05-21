@@ -89,6 +89,7 @@ type WorkersConfig struct {
 type PodConfig struct {
 	Image           string            `yaml:"image"`
 	ImagePullPolicy string            `yaml:"image_pull_policy,omitempty"`
+	ImagePullSecret string            `yaml:"image_pull_secret,omitempty"`
 	VmctlPath       string            `yaml:"vmctl_path,omitempty"`
 	Resources       ResourcesConfig   `yaml:"resources,omitempty"`
 	NodeSelector    map[string]string `yaml:"node_selector,omitempty"`

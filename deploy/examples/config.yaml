@@ -60,6 +60,7 @@ workers:
     # Image containing both vm-migrator and vmctl binaries
     image: "vm-migrator:latest"
     image_pull_policy: "IfNotPresent"
+    # image_pull_secret: "my-registry-secret"
 
     # Path to vmctl binary inside the worker container
     vmctl_path: "/usr/local/bin/vmctl"

@@ -431,6 +431,13 @@ func (m *Manager) buildDeployment() *appsv1.Deployment {
 			})
 	}
 
+	// Apply image pull secret
+	if cfg.Workers.Pod.ImagePullSecret != "" {
+		deploy.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: cfg.Workers.Pod.ImagePullSecret},
+		}
+	}
+
 	return deploy
 }
 
